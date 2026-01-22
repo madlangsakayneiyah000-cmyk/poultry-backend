@@ -1,20 +1,40 @@
 const express = require("express");
-const cors = require("cors");
+const mongoose = require("mongoose");
 require("dotenv").config();
-const connectDB = require("./config/db");
+
 
 const app = express();
 
-app.use(cors());
+
+// Middleware kung meron ka (JSON body, CORS, etc.)
 app.use(express.json());
 
-connectDB();
 
-app.get("/", (req, res) => {
-  res.send("Poultry Backend API is running");
+// Connect to MongoDB
+mongoose
+  .connect(process.env.MONGODB_URI)
+  .then(() => {
+    console.log("✅ MongoDB Connected");
+  })
+  .catch((err) => {
+    console.error("❌ MongoDB Error:", err);
+  });
+
+
+// Health endpoint
+app.get("/health", (req, res) => {
+  res.json({
+    status: "Backend is running",
+    timestamp: new Date().toISOString(),
+    version: "1.0.0",
+  });
 });
 
-const PORT = process.env.PORT || 10000;
+
+// Port for Render + local
+const PORT = process.env.PORT || 5000;
+
+
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 Server is running on port ${PORT}`);
 });
