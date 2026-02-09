@@ -1,29 +1,62 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
+const NodeCache = require("node-cache"); // ✅ NEW: Caching library
 require("dotenv").config();
 
 const app = express();
 
+// ===== ✅ NEW: CACHING SETUP =====
+// Cache sensor data for 5 seconds to reduce MongoDB queries
+const cache = new NodeCache({ 
+  stdTTL: 5,           // 5-second cache
+  checkperiod: 10,     // Check for expired keys every 10s
+  useClones: false     // Better performance
+});
+
 // ===== MIDDLEWARE =====
-app.use(cors()); // Allow frontend to connect
-app.use(express.json()); // Parse JSON body
+// ✅ OPTIMIZED: Restricted CORS for better security & performance
+app.use(cors({
+  origin: process.env.FRONTEND_URL || "*", // Specify your Netlify URL in production
+  methods: ["GET", "POST"],
+  credentials: true
+}));
+
+app.use(express.json({ limit: "10kb" })); // ✅ NEW: Limit payload size
+
+// ===== ✅ NEW: REQUEST RATE LIMITING =====
+// Prevents system overload from too many requests
+const rateLimit = require("express-rate-limit");
+const limiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute window
+  max: 100, // 100 requests per minute per IP
+  message: "Too many requests, please try again later"
+});
+app.use("/api", limiter);
 
 // ===== MONGODB CONNECTION =====
+// ✅ OPTIMIZED: Connection pooling for better performance
 mongoose
-  .connect(process.env.MONGODB_URI)
+  .connect(process.env.MONGODB_URI, {
+    maxPoolSize: 10,        // ✅ NEW: Connection pool (reuse connections)
+    minPoolSize: 2,         // ✅ NEW: Minimum connections
+    socketTimeoutMS: 45000, // ✅ NEW: Socket timeout
+    serverSelectionTimeoutMS: 10000, // ✅ NEW: Faster timeout
+  })
   .then(() => {
-    console.log("✅ MongoDB Connected");
+    console.log("✅ MongoDB Connected with connection pooling");
+    createIndexes(); // ✅ NEW: Create indexes on startup
   })
   .catch((err) => {
     console.error("❌ MongoDB Error:", err);
+    process.exit(1); // Exit if DB connection fails
   });
 
 // ===== MONGODB SCHEMAS =====
 
 // Sensor Data Schema (historical storage)
 const sensorSchema = new mongoose.Schema({
-  houseId: { type: String, default: "house-1" },
+  houseId: { type: String, default: "house-1", index: true }, // ✅ ADDED: Index
   temperature: { type: Number, required: true },
   humidity: { type: Number, required: true },
   ammonia: { type: Number, required: true },
@@ -36,8 +69,11 @@ const sensorSchema = new mongoose.Schema({
   lightStatus: { type: String, default: "OFF" },
   pressureWasherStatus: { type: String, default: "OFF" },
   mode: { type: String, default: "AUTO" },
-  createdAt: { type: Date, default: Date.now },
+  createdAt: { type: Date, default: Date.now, index: true }, // ✅ ADDED: Index
 });
+
+// ✅ NEW: Compound index for faster queries (most important!)
+sensorSchema.index({ houseId: 1, createdAt: -1 });
 
 const SensorData = mongoose.model("SensorData", sensorSchema);
 
@@ -53,8 +89,26 @@ const controlSchema = new mongoose.Schema({
 
 const ControlState = mongoose.model("ControlState", controlSchema);
 
+// ===== ✅ NEW: CREATE INDEXES FUNCTION =====
+async function createIndexes() {
+  try {
+    await SensorData.collection.createIndex({ houseId: 1, createdAt: -1 });
+    await SensorData.collection.createIndex({ createdAt: -1 });
+    console.log("✅ MongoDB indexes created successfully");
+  } catch (err) {
+    console.error("⚠️ Index creation warning:", err.message);
+  }
+}
+
 // ===== HELPER: Get or Create Control State =====
 async function getControlState() {
+  // ✅ OPTIMIZED: Check cache first
+  const cacheKey = "control_state";
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
   let control = await ControlState.findOne();
   if (!control) {
     control = await ControlState.create({
@@ -65,6 +119,9 @@ async function getControlState() {
       mode: "AUTO",
     });
   }
+
+  // ✅ NEW: Cache for 5 seconds
+  cache.set(cacheKey, control);
   return control;
 }
 
@@ -75,7 +132,11 @@ app.get("/health", (req, res) => {
   res.json({
     status: "Backend is running",
     timestamp: new Date().toISOString(),
-    version: "2.0.0",
+    version: "2.1.0-optimized",
+    cache: {
+      keys: cache.keys().length,
+      stats: cache.getStats()
+    }
   });
 });
 
@@ -110,7 +171,7 @@ app.post("/api/sensors", async (req, res) => {
       });
     }
 
-    // Save to MongoDB
+    // ✅ OPTIMIZED: Use lean() for faster saves
     const sensorData = await SensorData.create({
       houseId: houseId || "house-1",
       temperature,
@@ -127,6 +188,10 @@ app.post("/api/sensors", async (req, res) => {
       mode: mode || "AUTO",
     });
 
+    // ✅ NEW: Invalidate cache when new data arrives
+    cache.del("latest_sensor");
+    cache.del("sensor_history");
+
     return res.status(201).json({
       success: true,
       message: "Sensor data saved",
@@ -141,11 +206,25 @@ app.post("/api/sensors", async (req, res) => {
 // 2️⃣ GET /api/sensors/latest - Frontend gets latest sensor reading
 app.get("/api/sensors/latest", async (req, res) => {
   try {
-    const latestSensor = await SensorData.findOne().sort({ createdAt: -1 });
+    // ✅ OPTIMIZED: Check cache first
+    const cacheKey = "latest_sensor";
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    // ✅ OPTIMIZED: Use lean() and select only needed fields
+    const latestSensor = await SensorData.findOne()
+      .sort({ createdAt: -1 })
+      .select("-__v") // Exclude version key
+      .lean(); // ✅ NEW: Returns plain JS object (faster)
 
     if (!latestSensor) {
       return res.status(404).json({ message: "No sensor data yet" });
     }
+
+    // ✅ NEW: Cache the result
+    cache.set(cacheKey, latestSensor);
 
     return res.json(latestSensor);
   } catch (err) {
@@ -157,13 +236,29 @@ app.get("/api/sensors/latest", async (req, res) => {
 // 3️⃣ GET /api/sensors/history - Frontend gets data for charts
 app.get("/api/sensors/history", async (req, res) => {
   try {
-    const { limit = 24 } = req.query;
+    const { limit = 24, houseId = "house-1" } = req.query;
+    const parsedLimit = Math.min(parseInt(limit), 100); // ✅ NEW: Max 100 records
 
-    const history = await SensorData.find()
+    // ✅ OPTIMIZED: Cache key includes parameters
+    const cacheKey = `sensor_history_${houseId}_${parsedLimit}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    // ✅ OPTIMIZED: Use projection to fetch only needed fields
+    const history = await SensorData.find({ houseId })
       .sort({ createdAt: -1 })
-      .limit(parseInt(limit));
+      .limit(parsedLimit)
+      .select("temperature humidity ammonia methane light createdAt -_id") // ✅ NEW: Only chart data
+      .lean(); // ✅ NEW: Faster query
 
-    return res.json(history.reverse()); // Oldest to newest for chart
+    const reversed = history.reverse(); // Oldest to newest for chart
+
+    // ✅ NEW: Cache for 5 seconds
+    cache.set(cacheKey, reversed);
+
+    return res.json(reversed);
   } catch (err) {
     console.error("Error fetching sensor history:", err);
     return res.status(500).json({ error: "Server error" });
@@ -209,6 +304,9 @@ app.post("/api/control", async (req, res) => {
     control.updatedAt = new Date();
     await control.save();
 
+    // ✅ NEW: Invalidate cache after update
+    cache.del("control_state");
+
     return res.json({
       success: true,
       message: `Set ${target} to ${state}`,
@@ -220,8 +318,50 @@ app.post("/api/control", async (req, res) => {
   }
 });
 
+// ===== ADMIN: RETENTION POLICY (DELETE OLD DATA) =====
+// Deletes sensor data older than N days (default: 90)
+app.delete("/admin/cleanup", async (req, res) => {
+  try {
+    const { safeKey, days } = req.query;
+
+    // Simple protection: require secret key from .env
+    if (!safeKey || safeKey !== process.env.ADMIN_KEY) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const retentionDays = parseInt(days) || 90; // default: 90 days
+    const cutoffDate = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+
+    const result = await SensorData.deleteMany({
+      createdAt: { $lt: cutoffDate }
+    });
+
+    return res.json({
+      success: true,
+      message: `Deleted sensor data older than ${retentionDays} days`,
+      deletedCount: result.deletedCount,
+      cutoffDate
+    });
+  } catch (err) {
+    console.error("Error during cleanup:", err);
+    return res.status(500).json({ error: "Cleanup failed" });
+  }
+});
+
+
+// ===== ✅ NEW: GRACEFUL SHUTDOWN =====
+process.on("SIGINT", async () => {
+  console.log("\n⚠️ Shutting down gracefully...");
+  await mongoose.connection.close();
+  cache.flushAll();
+  console.log("✅ MongoDB connection closed");
+  process.exit(0);
+});
+
 // ===== START SERVER =====
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
+  console.log(`📊 Caching enabled with 5-second TTL`);
+  console.log(`🔒 Rate limiting: 100 requests/minute`);
 });
