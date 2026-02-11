@@ -1,62 +1,60 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
-const NodeCache = require("node-cache"); // ✅ NEW: Caching library
+const NodeCache = require("node-cache");
 require("dotenv").config();
 
 const app = express();
 
-// ===== ✅ NEW: CACHING SETUP =====
-// Cache sensor data for 5 seconds to reduce MongoDB queries
-const cache = new NodeCache({ 
-  stdTTL: 5,           // 5-second cache
-  checkperiod: 10,     // Check for expired keys every 10s
-  useClones: false     // Better performance
+// ===== CACHING SETUP =====
+const cache = new NodeCache({
+  stdTTL: 5,
+  checkperiod: 10,
+  useClones: false
 });
 
 // ===== MIDDLEWARE =====
-// ✅ OPTIMIZED: Restricted CORS for better security & performance
-app.use(cors({
-  origin: process.env.FRONTEND_URL || "*", // Specify your Netlify URL in production
-  methods: ["GET", "POST"],
-  credentials: true
-}));
+app.use(
+  cors({
+    origin: process.env.FRONTEND_URL || "*",
+    methods: ["GET", "POST"],
+    credentials: true
+  })
+);
 
-app.use(express.json({ limit: "10kb" })); // ✅ NEW: Limit payload size
+app.use(express.json({ limit: "10kb" }));
 
-// ===== ✅ NEW: REQUEST RATE LIMITING =====
-// Prevents system overload from too many requests
+// ===== REQUEST RATE LIMITING =====
 const rateLimit = require("express-rate-limit");
 const limiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute window
-  max: 100, // 100 requests per minute per IP
+  windowMs: 1 * 60 * 1000,
+  max: 100,
   message: "Too many requests, please try again later"
 });
 app.use("/api", limiter);
 
 // ===== MONGODB CONNECTION =====
-// ✅ OPTIMIZED: Connection pooling for better performance
 mongoose
   .connect(process.env.MONGODB_URI, {
-    maxPoolSize: 10,        // ✅ NEW: Connection pool (reuse connections)
-    minPoolSize: 2,         // ✅ NEW: Minimum connections
-    socketTimeoutMS: 45000, // ✅ NEW: Socket timeout
-    serverSelectionTimeoutMS: 10000, // ✅ NEW: Faster timeout
+    maxPoolSize: 10,
+    minPoolSize: 2,
+    socketTimeoutMS: 45000,
+    serverSelectionTimeoutMS: 10000
   })
   .then(() => {
     console.log("✅ MongoDB Connected with connection pooling");
-    createIndexes(); // ✅ NEW: Create indexes on startup
+    createIndexes();
   })
   .catch((err) => {
     console.error("❌ MongoDB Error:", err);
-    process.exit(1); // Exit if DB connection fails
+    process.exit(1);
   });
 
 // ===== MONGODB SCHEMAS =====
 
 // Sensor Data Schema (historical storage)
 const sensorSchema = new mongoose.Schema({
-  houseId: { type: String, default: "house-1", index: true }, // ✅ ADDED: Index
+  houseId: { type: String, default: "house-1", index: true },
   temperature: { type: Number, required: true },
   humidity: { type: Number, required: true },
   ammonia: { type: Number, required: true },
@@ -69,27 +67,77 @@ const sensorSchema = new mongoose.Schema({
   lightStatus: { type: String, default: "OFF" },
   pressureWasherStatus: { type: String, default: "OFF" },
   mode: { type: String, default: "AUTO" },
-  createdAt: { type: Date, default: Date.now, index: true }, // ✅ ADDED: Index
+  createdAt: { type: Date, default: Date.now, index: true }
 });
 
-// ✅ NEW: Compound index for faster queries (most important!)
 sensorSchema.index({ houseId: 1, createdAt: -1 });
 
 const SensorData = mongoose.model("SensorData", sensorSchema);
 
-// Control State Schema (latest actuator states)
+// ==== NEW CONTROL SCHEMA (TWO-WAY) ====
+// Per-device: mode + state + timer for pressure washer
 const controlSchema = new mongoose.Schema({
+  light: {
+    mode: {
+      type: String,
+      default: "AUTO",
+      enum: ["AUTO", "FORCE_ON", "FORCE_OFF"]
+    },
+    state: {
+      type: String,
+      default: "OFF",
+      enum: ["ON", "OFF"]
+    }
+  },
+  fan_positive: {
+    mode: {
+      type: String,
+      default: "AUTO",
+      enum: ["AUTO", "FORCE_ON", "FORCE_OFF"]
+    },
+    state: {
+      type: String,
+      default: "OFF",
+      enum: ["ON", "OFF"]
+    }
+  },
+  fan_negative: {
+    mode: {
+      type: String,
+      default: "AUTO",
+      enum: ["AUTO", "FORCE_ON", "FORCE_OFF"]
+    },
+    state: {
+      type: String,
+      default: "OFF",
+      enum: ["ON", "OFF"]
+    }
+  },
+  pressure_washer: {
+    mode: {
+      type: String,
+      default: "FORCE_OFF",
+      enum: ["FORCE_ON", "FORCE_OFF"] // walang AUTO
+    },
+    state: {
+      type: String,
+      default: "OFF",
+      enum: ["ON", "OFF"]
+    },
+    timerDuration: { type: Number, default: 0 },      // seconds
+    timerStartedAt: { type: Date, default: null },
+    timerExpiresAt: { type: Date, default: null }
+  },
+  // Legacy fields (optional, for backward compatibility)
   fanIntake: { type: String, default: "OFF" },
   fanExhaust: { type: String, default: "OFF" },
-  light: { type: String, default: "OFF" },
-  pressureWasher: { type: String, default: "OFF" },
   mode: { type: String, default: "AUTO" },
-  updatedAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
 });
 
 const ControlState = mongoose.model("ControlState", controlSchema);
 
-// ===== ✅ NEW: CREATE INDEXES FUNCTION =====
+// ===== CREATE INDEXES FUNCTION =====
 async function createIndexes() {
   try {
     await SensorData.collection.createIndex({ houseId: 1, createdAt: -1 });
@@ -102,25 +150,29 @@ async function createIndexes() {
 
 // ===== HELPER: Get or Create Control State =====
 async function getControlState() {
-  // ✅ OPTIMIZED: Check cache first
   const cacheKey = "control_state";
   const cached = cache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
+  if (cached) return cached;
 
   let control = await ControlState.findOne();
   if (!control) {
     control = await ControlState.create({
+      light: { mode: "AUTO", state: "OFF" },
+      fan_positive: { mode: "AUTO", state: "OFF" },
+      fan_negative: { mode: "AUTO", state: "OFF" },
+      pressure_washer: {
+        mode: "FORCE_OFF",
+        state: "OFF",
+        timerDuration: 0,
+        timerStartedAt: null,
+        timerExpiresAt: null
+      },
       fanIntake: "OFF",
       fanExhaust: "OFF",
-      light: "OFF",
-      pressureWasher: "OFF",
-      mode: "AUTO",
+      mode: "AUTO"
     });
   }
 
-  // ✅ NEW: Cache for 5 seconds
   cache.set(cacheKey, control);
   return control;
 }
@@ -132,7 +184,7 @@ app.get("/health", (req, res) => {
   res.json({
     status: "Backend is running",
     timestamp: new Date().toISOString(),
-    version: "2.1.0-optimized",
+    version: "2.2.0-two-way",
     cache: {
       keys: cache.keys().length,
       stats: cache.getStats()
@@ -140,7 +192,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// 1️⃣ POST /api/sensors - ESP32 sends sensor data here
+// 1️⃣ POST /api/sensors - ESP32 sends sensor data
 app.post("/api/sensors", async (req, res) => {
   try {
     const {
@@ -156,10 +208,9 @@ app.post("/api/sensors", async (req, res) => {
       fanExhaustDuty,
       lightStatus,
       pressureWasherStatus,
-      mode,
+      mode
     } = req.body;
 
-    // Validate required fields
     if (
       temperature === undefined ||
       humidity === undefined ||
@@ -167,11 +218,11 @@ app.post("/api/sensors", async (req, res) => {
       methane === undefined
     ) {
       return res.status(400).json({
-        error: "Missing required fields: temperature, humidity, ammonia, methane",
+        error:
+          "Missing required fields: temperature, humidity, ammonia, methane"
       });
     }
 
-    // ✅ OPTIMIZED: Use lean() for faster saves
     const sensorData = await SensorData.create({
       houseId: houseId || "house-1",
       temperature,
@@ -185,17 +236,16 @@ app.post("/api/sensors", async (req, res) => {
       fanExhaustDuty: fanExhaustDuty || 0,
       lightStatus: lightStatus || "OFF",
       pressureWasherStatus: pressureWasherStatus || "OFF",
-      mode: mode || "AUTO",
+      mode: mode || "AUTO"
     });
 
-    // ✅ NEW: Invalidate cache when new data arrives
     cache.del("latest_sensor");
     cache.del("sensor_history");
 
     return res.status(201).json({
       success: true,
       message: "Sensor data saved",
-      data: sensorData,
+      data: sensorData
     });
   } catch (err) {
     console.error("Error saving sensor data:", err);
@@ -203,29 +253,23 @@ app.post("/api/sensors", async (req, res) => {
   }
 });
 
-// 2️⃣ GET /api/sensors/latest - Frontend gets latest sensor reading
+// 2️⃣ GET /api/sensors/latest
 app.get("/api/sensors/latest", async (req, res) => {
   try {
-    // ✅ OPTIMIZED: Check cache first
     const cacheKey = "latest_sensor";
     const cached = cache.get(cacheKey);
-    if (cached) {
-      return res.json(cached);
-    }
+    if (cached) return res.json(cached);
 
-    // ✅ OPTIMIZED: Use lean() and select only needed fields
     const latestSensor = await SensorData.findOne()
       .sort({ createdAt: -1 })
-      .select("-__v") // Exclude version key
-      .lean(); // ✅ NEW: Returns plain JS object (faster)
+      .select("-__v")
+      .lean();
 
     if (!latestSensor) {
       return res.status(404).json({ message: "No sensor data yet" });
     }
 
-    // ✅ NEW: Cache the result
     cache.set(cacheKey, latestSensor);
-
     return res.json(latestSensor);
   } catch (err) {
     console.error("Error fetching latest sensor:", err);
@@ -233,29 +277,25 @@ app.get("/api/sensors/latest", async (req, res) => {
   }
 });
 
-// 3️⃣ GET /api/sensors/history - Frontend gets data for charts
+// 3️⃣ GET /api/sensors/history
 app.get("/api/sensors/history", async (req, res) => {
   try {
     const { limit = 24, houseId = "house-1" } = req.query;
-    const parsedLimit = Math.min(parseInt(limit), 100); // ✅ NEW: Max 100 records
+    const parsedLimit = Math.min(parseInt(limit), 100);
 
-    // ✅ OPTIMIZED: Cache key includes parameters
     const cacheKey = `sensor_history_${houseId}_${parsedLimit}`;
     const cached = cache.get(cacheKey);
-    if (cached) {
-      return res.json(cached);
-    }
+    if (cached) return res.json(cached);
 
-    // ✅ OPTIMIZED: Use projection to fetch only needed fields
     const history = await SensorData.find({ houseId })
       .sort({ createdAt: -1 })
       .limit(parsedLimit)
-      .select("temperature humidity ammonia methane light createdAt -_id") // ✅ NEW: Only chart data
-      .lean(); // ✅ NEW: Faster query
+      .select(
+        "temperature humidity ammonia methane light createdAt -_id"
+      )
+      .lean();
 
-    const reversed = history.reverse(); // Oldest to newest for chart
-
-    // ✅ NEW: Cache for 5 seconds
+    const reversed = history.reverse();
     cache.set(cacheKey, reversed);
 
     return res.json(reversed);
@@ -276,41 +316,78 @@ app.get("/api/control/state", async (req, res) => {
   }
 });
 
-// 5️⃣ POST /api/control - Frontend sends control commands
+// 5️⃣ POST /api/control - Dashboard sends TWO-WAY control commands
 app.post("/api/control", async (req, res) => {
   try {
-    const { target, state } = req.body;
+    const { device, mode, timerDuration } = req.body;
 
-    // Validate target
-    const validTargets = ["fanIntake", "fanExhaust", "light", "pressureWasher", "mode"];
-    if (!validTargets.includes(target)) {
-      return res.status(400).json({ error: "Invalid target" });
+    const validDevices = [
+      "light",
+      "fan_positive",
+      "fan_negative",
+      "pressure_washer"
+    ];
+    if (!validDevices.includes(device)) {
+      return res.status(400).json({
+        error: `Invalid device. Must be one of: ${validDevices.join(", ")}`
+      });
     }
 
-    // Validate state
-    if (target === "mode") {
-      if (!["AUTO", "MANUAL"].includes(state)) {
-        return res.status(400).json({ error: "Invalid mode (must be AUTO or MANUAL)" });
-      }
-    } else {
-      if (!["ON", "OFF"].includes(state)) {
-        return res.status(400).json({ error: "Invalid state (must be ON or OFF)" });
-      }
+    const validModes = ["AUTO", "FORCE_ON", "FORCE_OFF"];
+    if (!validModes.includes(mode)) {
+      return res.status(400).json({
+        error: `Invalid mode. Must be one of: ${validModes.join(", ")}`
+      });
     }
 
-    // Update control state in MongoDB
+    if (device === "pressure_washer" && mode === "AUTO") {
+      return res.status(400).json({
+        error:
+          "Pressure washer does not support AUTO mode. Use FORCE_ON or FORCE_OFF."
+      });
+    }
+
     const control = await getControlState();
-    control[target] = state;
+
+    control[device].mode = mode;
+
+    if (mode === "FORCE_ON") {
+      control[device].state = "ON";
+    } else if (mode === "FORCE_OFF") {
+      control[device].state = "OFF";
+    }
+
+    // Pressure washer timer logic
+    if (device === "pressure_washer") {
+      if (mode === "FORCE_ON") {
+        const duration = parseInt(timerDuration) || 300;
+        const now = new Date();
+        const expires = new Date(now.getTime() + duration * 1000);
+
+        control.pressure_washer.timerDuration = duration;
+        control.pressure_washer.timerStartedAt = now;
+        control.pressure_washer.timerExpiresAt = expires;
+
+        console.log(
+          `🚿 Pressure washer ON — auto-OFF in ${duration}s at ${expires.toISOString()}`
+        );
+      } else if (mode === "FORCE_OFF") {
+        control.pressure_washer.timerDuration = 0;
+        control.pressure_washer.timerStartedAt = null;
+        control.pressure_washer.timerExpiresAt = null;
+        console.log("🚿 Pressure washer manually turned OFF");
+      }
+    }
+
     control.updatedAt = new Date();
     await control.save();
 
-    // ✅ NEW: Invalidate cache after update
     cache.del("control_state");
 
     return res.json({
       success: true,
-      message: `Set ${target} to ${state}`,
-      controlState: control,
+      message: `${device} set to ${mode}`,
+      controlState: control
     });
   } catch (err) {
     console.error("Error updating control state:", err);
@@ -318,19 +395,19 @@ app.post("/api/control", async (req, res) => {
   }
 });
 
-// ===== ADMIN: RETENTION POLICY (DELETE OLD DATA) =====
-// Deletes sensor data older than N days (default: 90)
+// ===== ADMIN: RETENTION POLICY =====
 app.delete("/admin/cleanup", async (req, res) => {
   try {
     const { safeKey, days } = req.query;
 
-    // Simple protection: require secret key from .env
     if (!safeKey || safeKey !== process.env.ADMIN_KEY) {
       return res.status(403).json({ error: "Forbidden" });
     }
 
-    const retentionDays = parseInt(days) || 90; // default: 90 days
-    const cutoffDate = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+    const retentionDays = parseInt(days) || 90;
+    const cutoffDate = new Date(
+      Date.now() - retentionDays * 24 * 60 * 60 * 1000
+    );
 
     const result = await SensorData.deleteMany({
       createdAt: { $lt: cutoffDate }
@@ -348,8 +425,35 @@ app.delete("/admin/cleanup", async (req, res) => {
   }
 });
 
+// ===== PRESSURE WASHER SAFETY TIMER (background) =====
+setInterval(async () => {
+  try {
+    const control = await ControlState.findOne();
+    if (!control) return;
 
-// ===== ✅ NEW: GRACEFUL SHUTDOWN =====
+    const pw = control.pressure_washer;
+    if (pw.state === "ON" && pw.timerExpiresAt) {
+      const now = new Date();
+      if (now >= pw.timerExpiresAt) {
+        pw.state = "OFF";
+        pw.mode = "FORCE_OFF";
+        pw.timerDuration = 0;
+        pw.timerStartedAt = null;
+        pw.timerExpiresAt = null;
+
+        control.updatedAt = new Date();
+        await control.save();
+
+        cache.del("control_state");
+        console.log("🚿⏱️ Pressure washer AUTO-OFF: timer expired!");
+      }
+    }
+  } catch (err) {
+    console.error("⚠️ Pressure washer timer check error:", err.message);
+  }
+}, 10000);
+
+// ===== GRACEFUL SHUTDOWN =====
 process.on("SIGINT", async () => {
   console.log("\n⚠️ Shutting down gracefully...");
   await mongoose.connection.close();
