@@ -170,17 +170,6 @@ async function getControlState() {
       fanExhaust: "OFF",
       mode: "AUTO",
     });
-  } else {
-    // 🔧 MIGRATION FIX: kung string pa ang light, gawing object at i-save
-    if (typeof control.light === "string") {
-      const old = control.light; // "ON" or "OFF"
-      control.light = {
-        mode: old === "ON" ? "FORCE_ON" : "AUTO",
-        state: old === "ON" ? "ON" : "OFF",
-      };
-      await control.save();
-      console.log("🔧 Migrated legacy light field from string to object");
-    }
   }
 
   cache.set(cacheKey, control);
@@ -194,7 +183,7 @@ app.get("/health", (req, res) => {
   res.json({
     status: "Backend is running",
     timestamp: new Date().toISOString(),
-    version: "2.2.1-two-way-migrated",
+    version: "2.2.1-two-way-with-reset",
     cache: {
       keys: cache.keys().length,
       stats: cache.getStats(),
@@ -359,7 +348,6 @@ app.post("/api/control", async (req, res) => {
 
     const control = await getControlState();
 
-    // Normal update para sa lahat ng devices (light is guaranteed object na)
     control[device].mode = mode;
 
     if (mode === "FORCE_ON") {
@@ -464,15 +452,6 @@ setInterval(async () => {
   }
 }, 10000);
 
-// ===== GRACEFUL SHUTDOWN =====
-process.on("SIGINT", async () => {
-  console.log("\n⚠️ Shutting down gracefully...");
-  await mongoose.connection.close();
-  cache.flushAll();
-  console.log("✅ MongoDB connection closed");
-  process.exit(0);
-});
-
 // ===== TEMP: RESET CONTROL STATE (MIGRATION) =====
 app.post("/admin/reset-control", async (req, res) => {
   try {
@@ -505,6 +484,15 @@ app.post("/admin/reset-control", async (req, res) => {
     console.error("Reset control error:", err);
     return res.status(500).json({ error: "Reset failed" });
   }
+});
+
+// ===== GRACEFUL SHUTDOWN =====
+process.on("SIGINT", async () => {
+  console.log("\n⚠️ Shutting down gracefully...");
+  await mongoose.connection.close();
+  cache.flushAll();
+  console.log("✅ MongoDB connection closed");
+  process.exit(0);
 });
 
 // ===== START SERVER =====
