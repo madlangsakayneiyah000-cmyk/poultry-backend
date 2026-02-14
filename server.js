@@ -2,6 +2,7 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const NodeCache = require("node-cache");
+const rateLimit = require("express-rate-limit");
 require("dotenv").config();
 
 const app = express();
@@ -10,7 +11,7 @@ const app = express();
 const cache = new NodeCache({
   stdTTL: 5,
   checkperiod: 10,
-  useClones: false
+  useClones: false,
 });
 
 // ===== MIDDLEWARE =====
@@ -18,18 +19,17 @@ app.use(
   cors({
     origin: process.env.FRONTEND_URL || "*",
     methods: ["GET", "POST"],
-    credentials: true
+    credentials: true,
   })
 );
 
 app.use(express.json({ limit: "10kb" }));
 
 // ===== REQUEST RATE LIMITING =====
-const rateLimit = require("express-rate-limit");
 const limiter = rateLimit({
   windowMs: 1 * 60 * 1000,
   max: 100,
-  message: "Too many requests, please try again later"
+  message: "Too many requests, please try again later",
 });
 app.use("/api", limiter);
 
@@ -39,7 +39,7 @@ mongoose
     maxPoolSize: 10,
     minPoolSize: 2,
     socketTimeoutMS: 45000,
-    serverSelectionTimeoutMS: 10000
+    serverSelectionTimeoutMS: 10000,
   })
   .then(() => {
     console.log("✅ MongoDB Connected with connection pooling");
@@ -67,72 +67,71 @@ const sensorSchema = new mongoose.Schema({
   lightStatus: { type: String, default: "OFF" },
   pressureWasherStatus: { type: String, default: "OFF" },
   mode: { type: String, default: "AUTO" },
-  createdAt: { type: Date, default: Date.now, index: true }
+  createdAt: { type: Date, default: Date.now, index: true },
 });
 
 sensorSchema.index({ houseId: 1, createdAt: -1 });
 
 const SensorData = mongoose.model("SensorData", sensorSchema);
 
-// ==== NEW CONTROL SCHEMA (TWO-WAY) ====
-// Per-device: mode + state + timer for pressure washer
+// ==== CONTROL SCHEMA (TWO-WAY) ====
 const controlSchema = new mongoose.Schema({
   light: {
     mode: {
       type: String,
       default: "AUTO",
-      enum: ["AUTO", "FORCE_ON", "FORCE_OFF"]
+      enum: ["AUTO", "FORCE_ON", "FORCE_OFF"],
     },
     state: {
       type: String,
       default: "OFF",
-      enum: ["ON", "OFF"]
-    }
+      enum: ["ON", "OFF"],
+    },
   },
   fan_positive: {
     mode: {
       type: String,
       default: "AUTO",
-      enum: ["AUTO", "FORCE_ON", "FORCE_OFF"]
+      enum: ["AUTO", "FORCE_ON", "FORCE_OFF"],
     },
     state: {
       type: String,
       default: "OFF",
-      enum: ["ON", "OFF"]
-    }
+      enum: ["ON", "OFF"],
+    },
   },
   fan_negative: {
     mode: {
       type: String,
       default: "AUTO",
-      enum: ["AUTO", "FORCE_ON", "FORCE_OFF"]
+      enum: ["AUTO", "FORCE_ON", "FORCE_OFF"],
     },
     state: {
       type: String,
       default: "OFF",
-      enum: ["ON", "OFF"]
-    }
+      enum: ["ON", "OFF"],
+    },
   },
   pressure_washer: {
     mode: {
       type: String,
       default: "FORCE_OFF",
-      enum: ["FORCE_ON", "FORCE_OFF"] // walang AUTO
+      enum: ["FORCE_ON", "FORCE_OFF"], // walang AUTO
     },
     state: {
       type: String,
       default: "OFF",
-      enum: ["ON", "OFF"]
+      enum: ["ON", "OFF"],
     },
-    timerDuration: { type: Number, default: 0 },      // seconds
+    timerDuration: { type: Number, default: 0 }, // seconds
     timerStartedAt: { type: Date, default: null },
-    timerExpiresAt: { type: Date, default: null }
+    timerExpiresAt: { type: Date, default: null },
   },
-  // Legacy fields (optional, for backward compatibility)
+  // Legacy fields (optional, for backward compatibility / UI)
   fanIntake: { type: String, default: "OFF" },
   fanExhaust: { type: String, default: "OFF" },
   mode: { type: String, default: "AUTO" },
-  updatedAt: { type: Date, default: Date.now }
+  updatedAt: { type: Date, default: Date.now },
 });
 
 const ControlState = mongoose.model("ControlState", controlSchema);
@@ -165,11 +164,11 @@ async function getControlState() {
         state: "OFF",
         timerDuration: 0,
         timerStartedAt: null,
-        timerExpiresAt: null
+        timerExpiresAt: null,
       },
       fanIntake: "OFF",
       fanExhaust: "OFF",
-      mode: "AUTO"
+      mode: "AUTO",
     });
   }
 
@@ -187,8 +186,8 @@ app.get("/health", (req, res) => {
     version: "2.2.0-two-way",
     cache: {
       keys: cache.keys().length,
-      stats: cache.getStats()
-    }
+      stats: cache.getStats(),
+    },
   });
 });
 
@@ -208,7 +207,7 @@ app.post("/api/sensors", async (req, res) => {
       fanExhaustDuty,
       lightStatus,
       pressureWasherStatus,
-      mode
+      mode,
     } = req.body;
 
     if (
@@ -219,7 +218,7 @@ app.post("/api/sensors", async (req, res) => {
     ) {
       return res.status(400).json({
         error:
-          "Missing required fields: temperature, humidity, ammonia, methane"
+          "Missing required fields: temperature, humidity, ammonia, methane",
       });
     }
 
@@ -236,7 +235,7 @@ app.post("/api/sensors", async (req, res) => {
       fanExhaustDuty: fanExhaustDuty || 0,
       lightStatus: lightStatus || "OFF",
       pressureWasherStatus: pressureWasherStatus || "OFF",
-      mode: mode || "AUTO"
+      mode: mode || "AUTO",
     });
 
     cache.del("latest_sensor");
@@ -245,7 +244,7 @@ app.post("/api/sensors", async (req, res) => {
     return res.status(201).json({
       success: true,
       message: "Sensor data saved",
-      data: sensorData
+      data: sensorData,
     });
   } catch (err) {
     console.error("Error saving sensor data:", err);
@@ -325,30 +324,39 @@ app.post("/api/control", async (req, res) => {
       "light",
       "fan_positive",
       "fan_negative",
-      "pressure_washer"
+      "pressure_washer",
     ];
     if (!validDevices.includes(device)) {
       return res.status(400).json({
-        error: `Invalid device. Must be one of: ${validDevices.join(", ")}`
+        error: `Invalid device. Must be one of: ${validDevices.join(", ")}`,
       });
     }
 
     const validModes = ["AUTO", "FORCE_ON", "FORCE_OFF"];
     if (!validModes.includes(mode)) {
       return res.status(400).json({
-        error: `Invalid mode. Must be one of: ${validModes.join(", ")}`
+        error: `Invalid mode. Must be one of: ${validModes.join(", ")}`,
       });
     }
 
     if (device === "pressure_washer" && mode === "AUTO") {
       return res.status(400).json({
         error:
-          "Pressure washer does not support AUTO mode. Use FORCE_ON or FORCE_OFF."
+          "Pressure washer does not support AUTO mode. Use FORCE_ON or FORCE_OFF.",
       });
     }
 
     const control = await getControlState();
 
+    // 🔧 SELF-FIX: kung luma pa ang format (string ang light), i-upgrade siya on the fly
+    if (typeof control.light === "string") {
+      control.light = {
+        mode: control.light === "ON" ? "FORCE_ON" : "AUTO",
+        state: control.light === "ON" ? "ON" : "OFF",
+      };
+    }
+
+    // Normal update para sa lahat ng devices
     control[device].mode = mode;
 
     if (mode === "FORCE_ON") {
@@ -387,7 +395,7 @@ app.post("/api/control", async (req, res) => {
     return res.json({
       success: true,
       message: `${device} set to ${mode}`,
-      controlState: control
+      controlState: control,
     });
   } catch (err) {
     console.error("Error updating control state:", err);
@@ -410,14 +418,14 @@ app.delete("/admin/cleanup", async (req, res) => {
     );
 
     const result = await SensorData.deleteMany({
-      createdAt: { $lt: cutoffDate }
+      createdAt: { $lt: cutoffDate },
     });
 
     return res.json({
       success: true,
       message: `Deleted sensor data older than ${retentionDays} days`,
       deletedCount: result.deletedCount,
-      cutoffDate
+      cutoffDate,
     });
   } catch (err) {
     console.error("Error during cleanup:", err);
@@ -461,13 +469,12 @@ process.on("SIGINT", async () => {
   console.log("✅ MongoDB connection closed");
   process.exit(0);
 });
+
 // ===== TEMP: RESET CONTROL STATE (MIGRATION) =====
 app.post("/admin/reset-control", async (req, res) => {
   try {
-    // burahin lahat ng lumang control documents
     await ControlState.deleteMany({});
 
-    // gumawa ng bagong control document na tama ang format
     const control = await ControlState.create({
       light: { mode: "AUTO", state: "OFF" },
       fan_positive: { mode: "AUTO", state: "OFF" },
@@ -477,20 +484,19 @@ app.post("/admin/reset-control", async (req, res) => {
         state: "OFF",
         timerDuration: 0,
         timerStartedAt: null,
-        timerExpiresAt: null
+        timerExpiresAt: null,
       },
       fanIntake: "OFF",
       fanExhaust: "OFF",
-      mode: "AUTO"
+      mode: "AUTO",
     });
 
-    // linisin ang cache para fresh
     cache.del("control_state");
 
     return res.json({
       success: true,
       message: "Control state reset",
-      control
+      control,
     });
   } catch (err) {
     console.error("Reset control error:", err);
