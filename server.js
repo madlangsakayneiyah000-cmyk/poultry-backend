@@ -35,7 +35,7 @@ app.use("/api", limiter);
 
 // ===== MONGODB CONNECTION =====
 mongoose
-  .connect(process.env.MONGODB_URI, {
+  .connect(process.env.MONGODB_MURI, {
     maxPoolSize: 10,
     minPoolSize: 2,
     socketTimeoutMS: 45000,
@@ -170,6 +170,17 @@ async function getControlState() {
       fanExhaust: "OFF",
       mode: "AUTO",
     });
+  } else {
+    // 🔧 MIGRATION FIX: kung string pa ang light, gawing object at i-save
+    if (typeof control.light === "string") {
+      const old = control.light; // "ON" or "OFF"
+      control.light = {
+        mode: old === "ON" ? "FORCE_ON" : "AUTO",
+        state: old === "ON" ? "ON" : "OFF",
+      };
+      await control.save();
+      console.log("🔧 Migrated legacy light field from string to object");
+    }
   }
 
   cache.set(cacheKey, control);
@@ -183,7 +194,7 @@ app.get("/health", (req, res) => {
   res.json({
     status: "Backend is running",
     timestamp: new Date().toISOString(),
-    version: "2.2.0-two-way",
+    version: "2.2.1-two-way-migrated",
     cache: {
       keys: cache.keys().length,
       stats: cache.getStats(),
@@ -348,15 +359,7 @@ app.post("/api/control", async (req, res) => {
 
     const control = await getControlState();
 
-    // 🔧 SELF-FIX: kung luma pa ang format (string ang light), i-upgrade siya on the fly
-    if (typeof control.light === "string") {
-      control.light = {
-        mode: control.light === "ON" ? "FORCE_ON" : "AUTO",
-        state: control.light === "ON" ? "ON" : "OFF",
-      };
-    }
-
-    // Normal update para sa lahat ng devices
+    // Normal update para sa lahat ng devices (light is guaranteed object na)
     control[device].mode = mode;
 
     if (mode === "FORCE_ON") {
