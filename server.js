@@ -461,6 +461,42 @@ process.on("SIGINT", async () => {
   console.log("✅ MongoDB connection closed");
   process.exit(0);
 });
+// ===== TEMP: RESET CONTROL STATE (MIGRATION) =====
+app.post("/admin/reset-control", async (req, res) => {
+  try {
+    // burahin lahat ng lumang control documents
+    await ControlState.deleteMany({});
+
+    // gumawa ng bagong control document na tama ang format
+    const control = await ControlState.create({
+      light: { mode: "AUTO", state: "OFF" },
+      fan_positive: { mode: "AUTO", state: "OFF" },
+      fan_negative: { mode: "AUTO", state: "OFF" },
+      pressure_washer: {
+        mode: "FORCE_OFF",
+        state: "OFF",
+        timerDuration: 0,
+        timerStartedAt: null,
+        timerExpiresAt: null
+      },
+      fanIntake: "OFF",
+      fanExhaust: "OFF",
+      mode: "AUTO"
+    });
+
+    // linisin ang cache para fresh
+    cache.del("control_state");
+
+    return res.json({
+      success: true,
+      message: "Control state reset",
+      control
+    });
+  } catch (err) {
+    console.error("Reset control error:", err);
+    return res.status(500).json({ error: "Reset failed" });
+  }
+});
 
 // ===== START SERVER =====
 const PORT = process.env.PORT || 10000;
