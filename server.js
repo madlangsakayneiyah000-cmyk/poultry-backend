@@ -35,7 +35,7 @@ app.use("/api", limiter);
 
 // ===== MONGODB CONNECTION =====
 mongoose
-  .connect(process.env.MONGODB_MURI, {
+  .connect(process.env.MONGODB_URI, {
     maxPoolSize: 10,
     minPoolSize: 2,
     socketTimeoutMS: 45000,
