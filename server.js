@@ -150,10 +150,13 @@ async function createIndexes() {
 // ===== HELPER: Get or Create Control State =====
 async function getControlState() {
   const cacheKey = "control_state";
-  const cached = cache.get(cacheKey);
-  if (cached) return cached;
+  // Huwag munang gamitin cache habang inaayos natin schema
+  // const cached = cache.get(cacheKey);
+  // if (cached) return cached;
 
   let control = await ControlState.findOne();
+
+  // Walang document pa – gumawa ng bago
   if (!control) {
     control = await ControlState.create({
       light: { mode: "AUTO", state: "OFF" },
@@ -170,6 +173,30 @@ async function getControlState() {
       fanExhaust: "OFF",
       mode: "AUTO",
     });
+  } else {
+    // May document pero mali structure (light = string)
+    if (typeof control.light === "string") {
+      console.log("🔧 Found legacy control doc, resetting it...");
+      await ControlState.deleteMany({});
+
+      control = await ControlState.create({
+        light: { mode: "AUTO", state: "OFF" },
+        fan_positive: { mode: "AUTO", state: "OFF" },
+        fan_negative: { mode: "AUTO", state: "OFF" },
+        pressure_washer: {
+          mode: "FORCE_OFF",
+          state: "OFF",
+          timerDuration: 0,
+          timerStartedAt: null,
+          timerExpiresAt: null,
+        },
+        fanIntake: "OFF",
+        fanExhaust: "OFF",
+        mode: "AUTO",
+      });
+
+      console.log("🔧 Control state reset to new schema");
+    }
   }
 
   cache.set(cacheKey, control);
