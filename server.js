@@ -342,20 +342,30 @@ app.get("/api/control/state", async (req, res) => {
   }
 });
 
-// 5️⃣ POST /api/control - Dashboard sends TWO-WAY control commands
+// 5️⃣ POST /api/control - Dashboard sends TWO-WAY control commands (aligned with unified fan)
 app.post("/api/control", async (req, res) => {
   try {
     const { device, mode, timerDuration } = req.body;
 
-    const validDevices = [
-      "light",
-      "fan_positive",
-      "fan_negative",
-      "pressure_washer",
-    ];
-    if (!validDevices.includes(device)) {
+    // Map frontend device -> actual devices in control schema
+    // Frontend sends: "light", "fan", "pressure_washer"
+    // Backend schema has: light, fan_positive, fan_negative, pressure_washer
+    let targetDevices = [];
+
+    if (device === "fan") {
+      // Unified fan control: apply to both positive + negative fans
+      targetDevices = ["fan_positive", "fan_negative"];
+    } else if (
+      device === "light" ||
+      device === "fan_positive" ||
+      device === "fan_negative" ||
+      device === "pressure_washer"
+    ) {
+      targetDevices = [device];
+    } else {
       return res.status(400).json({
-        error: `Invalid device. Must be one of: ${validDevices.join(", ")}`,
+        error:
+          'Invalid device. Must be one of: "light", "fan", "fan_positive", "fan_negative", "pressure_washer"',
       });
     }
 
@@ -366,7 +376,8 @@ app.post("/api/control", async (req, res) => {
       });
     }
 
-    if (device === "pressure_washer" && mode === "AUTO") {
+    // Pressure washer does not support AUTO
+    if (targetDevices.includes("pressure_washer") && mode === "AUTO") {
       return res.status(400).json({
         error:
           "Pressure washer does not support AUTO mode. Use FORCE_ON or FORCE_OFF.",
@@ -375,18 +386,22 @@ app.post("/api/control", async (req, res) => {
 
     const control = await getControlState();
 
-    control[device].mode = mode;
+    // Apply mode/state to all target devices
+    for (const dev of targetDevices) {
+      control[dev].mode = mode;
 
-    if (mode === "FORCE_ON") {
-      control[device].state = "ON";
-    } else if (mode === "FORCE_OFF") {
-      control[device].state = "OFF";
+      if (mode === "FORCE_ON") {
+        control[dev].state = "ON";
+      } else if (mode === "FORCE_OFF") {
+        control[dev].state = "OFF";
+      }
     }
 
-    // Pressure washer timer logic
-    if (device === "pressure_washer") {
+    // Pressure washer timer logic (only if included in targetDevices)
+    if (targetDevices.includes("pressure_washer")) {
       if (mode === "FORCE_ON") {
-        const duration = parseInt(timerDuration) || 300;
+        // Use timerDuration from frontend if provided, else default 300s
+        const duration = parseInt(timerDuration, 10) || 300;
         const now = new Date();
         const expires = new Date(now.getTime() + duration * 1000);
 
@@ -418,36 +433,6 @@ app.post("/api/control", async (req, res) => {
   } catch (err) {
     console.error("Error updating control state:", err);
     return res.status(500).json({ error: "Server error" });
-  }
-});
-
-// ===== ADMIN: RETENTION POLICY =====
-app.delete("/admin/cleanup", async (req, res) => {
-  try {
-    const { safeKey, days } = req.query;
-
-    if (!safeKey || safeKey !== process.env.ADMIN_KEY) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
-
-    const retentionDays = parseInt(days) || 90;
-    const cutoffDate = new Date(
-      Date.now() - retentionDays * 24 * 60 * 60 * 1000
-    );
-
-    const result = await SensorData.deleteMany({
-      createdAt: { $lt: cutoffDate },
-    });
-
-    return res.json({
-      success: true,
-      message: `Deleted sensor data older than ${retentionDays} days`,
-      deletedCount: result.deletedCount,
-      cutoffDate,
-    });
-  } catch (err) {
-    console.error("Error during cleanup:", err);
-    return res.status(500).json({ error: "Cleanup failed" });
   }
 });
 
