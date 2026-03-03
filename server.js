@@ -116,18 +116,17 @@ const controlSchema = new mongoose.Schema({
     mode: {
       type: String,
       default: "FORCE_OFF",
-      enum: ["FORCE_ON", "FORCE_OFF"], // walang AUTO
+      enum: ["FORCE_ON", "FORCE_OFF"],
     },
     state: {
       type: String,
       default: "OFF",
       enum: ["ON", "OFF"],
     },
-    timerDuration: { type: Number, default: 0 }, // seconds
+    timerDuration: { type: Number, default: 0 },
     timerStartedAt: { type: Date, default: null },
     timerExpiresAt: { type: Date, default: null },
   },
-  // Legacy fields (optional, for backward compatibility / UI)
   fanIntake: { type: String, default: "OFF" },
   fanExhaust: { type: String, default: "OFF" },
   mode: { type: String, default: "AUTO" },
@@ -150,13 +149,8 @@ async function createIndexes() {
 // ===== HELPER: Get or Create Control State =====
 async function getControlState() {
   const cacheKey = "control_state";
-  // Huwag munang gamitin cache habang inaayos natin schema
-  // const cached = cache.get(cacheKey);
-  // if (cached) return cached;
-
   let control = await ControlState.findOne();
 
-  // Walang document pa – gumawa ng bago
   if (!control) {
     control = await ControlState.create({
       light: { mode: "AUTO", state: "OFF" },
@@ -174,7 +168,6 @@ async function getControlState() {
       mode: "AUTO",
     });
   } else {
-    // May document pero mali structure (light = string)
     if (typeof control.light === "string") {
       console.log("🔧 Found legacy control doc, resetting it...");
       await ControlState.deleteMany({});
@@ -210,7 +203,7 @@ app.get("/health", (req, res) => {
   res.json({
     status: "Backend is running",
     timestamp: new Date().toISOString(),
-    version: "2.2.1-two-way-with-reset",
+    version: "2.3.0-with-restore",
     cache: {
       keys: cache.keys().length,
       stats: cache.getStats(),
@@ -316,9 +309,7 @@ app.get("/api/sensors/history", async (req, res) => {
     const history = await SensorData.find({ houseId })
       .sort({ createdAt: -1 })
       .limit(parsedLimit)
-      .select(
-        "temperature humidity ammonia methane light createdAt -_id"
-      )
+      .select("temperature humidity ammonia methane light createdAt -_id")
       .lean();
 
     const reversed = history.reverse();
@@ -342,18 +333,14 @@ app.get("/api/control/state", async (req, res) => {
   }
 });
 
-// 5️⃣ POST /api/control - Dashboard sends TWO-WAY control commands (aligned with unified fan)
+// 5️⃣ POST /api/control - Dashboard sends TWO-WAY control commands
 app.post("/api/control", async (req, res) => {
   try {
     const { device, mode, timerDuration } = req.body;
 
-    // Map frontend device -> actual devices in control schema
-    // Frontend sends: "light", "fan", "pressure_washer"
-    // Backend schema has: light, fan_positive, fan_negative, pressure_washer
     let targetDevices = [];
 
     if (device === "fan") {
-      // Unified fan control: apply to both positive + negative fans
       targetDevices = ["fan_positive", "fan_negative"];
     } else if (
       device === "light" ||
@@ -376,7 +363,6 @@ app.post("/api/control", async (req, res) => {
       });
     }
 
-    // Pressure washer does not support AUTO
     if (targetDevices.includes("pressure_washer") && mode === "AUTO") {
       return res.status(400).json({
         error:
@@ -386,7 +372,6 @@ app.post("/api/control", async (req, res) => {
 
     const control = await getControlState();
 
-    // Apply mode/state to all target devices
     for (const dev of targetDevices) {
       control[dev].mode = mode;
 
@@ -397,10 +382,8 @@ app.post("/api/control", async (req, res) => {
       }
     }
 
-    // Pressure washer timer logic (only if included in targetDevices)
     if (targetDevices.includes("pressure_washer")) {
       if (mode === "FORCE_ON") {
-        // Use timerDuration from frontend if provided, else default 300s
         const duration = parseInt(timerDuration, 10) || 300;
         const now = new Date();
         const expires = new Date(now.getTime() + duration * 1000);
@@ -433,6 +416,62 @@ app.post("/api/control", async (req, res) => {
   } catch (err) {
     console.error("Error updating control state:", err);
     return res.status(500).json({ error: "Server error" });
+  }
+});
+
+// 🔄 NEW: POST /api/control/restore - Manual restore from DB to ESP32
+app.post("/api/control/restore", async (req, res) => {
+  try {
+    const control = await getControlState();
+
+    const commands = [];
+
+    // Light
+    if (control.light) {
+      commands.push({
+        device: "light",
+        mode: control.light.mode,
+        state: control.light.state,
+      });
+    }
+
+    // Unified Fan (both positive + negative)
+    if (control.fan_positive) {
+      commands.push({
+        device: "fan",
+        mode: control.fan_positive.mode,
+        state: control.fan_positive.state,
+      });
+    }
+
+    // Pressure Washer
+    if (control.pressure_washer) {
+      commands.push({
+        device: "pressure_washer",
+        mode: control.pressure_washer.mode,
+        state: control.pressure_washer.state,
+      });
+    }
+
+    // TODO: Publish via MQTT
+    // Example: mqttClient.publish('poultry/control', JSON.stringify(cmd))
+    // You need to add MQTT client setup (see installation instructions below)
+
+    console.log("🔄 Restore commands prepared:", commands);
+
+    return res.json({
+      success: true,
+      message: "Control state restored (commands prepared for ESP32)",
+      restored: {
+        light: control.light,
+        fan: control.fan_positive,
+        washer: control.pressure_washer,
+      },
+      commands,
+    });
+  } catch (err) {
+    console.error("Restore error:", err);
+    return res.status(500).json({ error: "Failed to restore state" });
   }
 });
 
