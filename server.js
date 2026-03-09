@@ -6,6 +6,7 @@ const rateLimit = require("express-rate-limit");
 require("dotenv").config();
 
 const app = express();
+app.set("trust proxy", 1); // IMPORTANT for Render/proxy + express-rate-limit
 
 // ===== CACHING SETUP =====
 const cache = new NodeCache({
@@ -27,8 +28,8 @@ app.use(express.json({ limit: "10kb" }));
 
 // ===== REQUEST RATE LIMITING =====
 const limiter = rateLimit({
-  windowMs: 1 * 60 * 1000,
-  max: 100,
+  windowMs: 60 * 1000, // 1 minute
+  max: 300, // mas mataas para kayanin 2 MCU + dashboard
   message: "Too many requests, please try again later",
 });
 app.use("/api", limiter);
@@ -333,7 +334,7 @@ function generateAlertsFromReading(reading) {
     });
   }
 
-  // Methane (placeholder ranges)
+  // Methane
   if (methane > 10) {
     alerts.push({
       houseId: hid,
