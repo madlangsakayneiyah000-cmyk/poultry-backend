@@ -70,9 +70,7 @@ const sensorSchema = new mongoose.Schema({
   mode: { type: String, default: "AUTO" },
   createdAt: { type: Date, default: Date.now, index: true },
 });
-
 sensorSchema.index({ houseId: 1, createdAt: -1 });
-
 const SensorData = mongoose.model("SensorData", sensorSchema);
 
 // Control schema (two-way)
@@ -133,7 +131,6 @@ const controlSchema = new mongoose.Schema({
   mode: { type: String, default: "AUTO" },
   updatedAt: { type: Date, default: Date.now },
 });
-
 const ControlState = mongoose.model("ControlState", controlSchema);
 
 // Alert Schema (for early warning / ML-derived anomalies)
@@ -163,7 +160,6 @@ const alertSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
-
 const Alert = mongoose.model("Alert", alertSchema);
 
 // ===== CREATE INDEXES FUNCTION =====
@@ -233,7 +229,7 @@ async function getControlStateForRead() {
   return control;
 }
 
-// ===== ANOMALY RULES (OLD: early warning + fault detection) =====
+// ===== ANOMALY RULES (rule-based, from offline ML thresholds) =====
 function generateAlertsFromReading(reading) {
   const alerts = [];
 
@@ -253,7 +249,7 @@ function generateAlertsFromReading(reading) {
   const readingTime = createdAt || new Date();
   const hid = houseId || "house-1";
 
-  // Temperature (early warning + critical)
+  // Temperature (you can tweak these using your offline ML results)
   if (temperature < 27 || temperature > 36) {
     alerts.push({
       houseId: hid,
@@ -399,7 +395,7 @@ app.get("/health", (req, res) => {
   res.json({
     status: "Backend is running",
     timestamp: new Date().toISOString(),
-    version: "2.5.0-old-logic-with-light-status",
+    version: "2.6.0-concurrency-safe",
     cache: {
       keys: cache.keys().length,
       stats: cache.getStats(),
@@ -535,7 +531,7 @@ app.get("/api/control/state", async (req, res) => {
   }
 });
 
-// 5️⃣ POST /api/control - Dashboard sends TWO-WAY control commands
+// 5️⃣ POST /api/control - Dashboard sends TWO-WAY control commands (atomic)
 app.post("/api/control", async (req, res) => {
   try {
     const { device, mode, timerDuration } = req.body;
@@ -572,41 +568,48 @@ app.post("/api/control", async (req, res) => {
       });
     }
 
-    const control = await getControlState();
+    const updateObj = {};
 
+    // Per-device fields to update
     for (const dev of targetDevices) {
-      control[dev].mode = mode;
+      updateObj[`${dev}.mode`] = mode;
 
       if (mode === "FORCE_ON") {
-        control[dev].state = "ON";
+        updateObj[`${dev}.state`] = "ON";
       } else if (mode === "FORCE_OFF") {
-        control[dev].state = "OFF";
+        updateObj[`${dev}.state`] = "OFF";
       }
     }
 
+    // Pressure washer timer handling
     if (targetDevices.includes("pressure_washer")) {
       if (mode === "FORCE_ON") {
         const duration = parseInt(timerDuration, 10) || 300;
         const now = new Date();
         const expires = new Date(now.getTime() + duration * 1000);
 
-        control.pressure_washer.timerDuration = duration;
-        control.pressure_washer.timerStartedAt = now;
-        control.pressure_washer.timerExpiresAt = expires;
+        updateObj["pressure_washer.timerDuration"] = duration;
+        updateObj["pressure_washer.timerStartedAt"] = now;
+        updateObj["pressure_washer.timerExpiresAt"] = expires;
 
         console.log(
           `🚿 Pressure washer ON — auto-OFF in ${duration}s at ${expires.toISOString()}`
         );
       } else if (mode === "FORCE_OFF") {
-        control.pressure_washer.timerDuration = 0;
-        control.pressure_washer.timerStartedAt = null;
-        control.pressure_washer.timerExpiresAt = null;
+        updateObj["pressure_washer.timerDuration"] = 0;
+        updateObj["pressure_washer.timerStartedAt"] = null;
+        updateObj["pressure_washer.timerExpiresAt"] = null;
         console.log("🚿 Pressure washer manually turned OFF");
       }
     }
 
-    control.updatedAt = new Date();
-    await control.save();
+    updateObj.updatedAt = new Date();
+
+    const control = await ControlState.findOneAndUpdate(
+      {},
+      { $set: updateObj },
+      { new: true, upsert: true }
+    );
 
     cache.del("control_state");
     cache.del("control_state_read");
@@ -639,20 +642,27 @@ app.get("/api/alerts", async (req, res) => {
   }
 });
 
-// 7️⃣ POST /api/light-status — Light MCU sends ONLY light/washer status (NEW)
+// 7️⃣ POST /api/light-status — Light MCU sends ONLY light/washer status (atomic)
 app.post("/api/light-status", async (req, res) => {
   try {
     const { light, lightStatus, pressureWasherStatus } = req.body;
 
-    const latestSensor = await SensorData.findOne().sort({ createdAt: -1 });
+    const updateFields = {};
+    if (light != null && light >= 0) updateFields.light = light;
+    if (lightStatus) updateFields.lightStatus = lightStatus;
+    if (pressureWasherStatus) updateFields.pressureWasherStatus =
+      pressureWasherStatus;
 
-    if (latestSensor) {
-      if (light != null && light >= 0) latestSensor.light = light;
-      if (lightStatus) latestSensor.lightStatus = lightStatus;
-      if (pressureWasherStatus)
-        latestSensor.pressureWasherStatus = pressureWasherStatus;
-      await latestSensor.save();
-    } else {
+    const latestUpdated = await SensorData.findOneAndUpdate(
+      {},
+      { $set: updateFields },
+      {
+        sort: { createdAt: -1 },
+        new: true,
+      }
+    );
+
+    if (!latestUpdated) {
       await SensorData.create({
         houseId: "house-1",
         temperature: 0,
@@ -761,5 +771,5 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
   console.log(`📊 Caching enabled with 5-second TTL`);
-  console.log(`🔒 Rate limiting: 100 requests/minute`);
+  console.log(`🔒 Rate limiting: 300 requests/minute`);
 });
