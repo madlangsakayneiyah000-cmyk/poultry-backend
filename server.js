@@ -3,10 +3,11 @@ const mongoose = require("mongoose");
 const cors = require("cors");
 const NodeCache = require("node-cache");
 const rateLimit = require("express-rate-limit");
+const { exec } = require("child_process");
+const path = require("path");
 require("dotenv").config();
 
 const app = express();
-app.set("trust proxy", 1); // IMPORTANT for Render/proxy + express-rate-limit
 
 // ===== CACHING SETUP =====
 const cache = new NodeCache({
@@ -28,8 +29,8 @@ app.use(express.json({ limit: "10kb" }));
 
 // ===== REQUEST RATE LIMITING =====
 const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 300, // mas mataas para kayanin 2 MCU + dashboard
+  windowMs: 1 * 60 * 1000,
+  max: 100,
   message: "Too many requests, please try again later",
 });
 app.use("/api", limiter);
@@ -70,10 +71,12 @@ const sensorSchema = new mongoose.Schema({
   mode: { type: String, default: "AUTO" },
   createdAt: { type: Date, default: Date.now, index: true },
 });
+
 sensorSchema.index({ houseId: 1, createdAt: -1 });
+
 const SensorData = mongoose.model("SensorData", sensorSchema);
 
-// Control schema (two-way)
+// Control Schema (two-way)
 const controlSchema = new mongoose.Schema({
   light: {
     mode: {
@@ -131,15 +134,16 @@ const controlSchema = new mongoose.Schema({
   mode: { type: String, default: "AUTO" },
   updatedAt: { type: Date, default: Date.now },
 });
+
 const ControlState = mongoose.model("ControlState", controlSchema);
 
-// Alert Schema (for early warning / ML-derived anomalies)
+// Alert Schema
 const alertSchema = new mongoose.Schema(
   {
     houseId: { type: String, default: "house-1", index: true },
     type: {
       type: String,
-      enum: ["info", "warning", "critical"],
+      enum: ["info", "warning", "critical", "fault"],
       required: true,
     },
     category: {
@@ -160,6 +164,7 @@ const alertSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
 const Alert = mongoose.model("Alert", alertSchema);
 
 // ===== CREATE INDEXES FUNCTION =====
@@ -171,6 +176,14 @@ async function createIndexes() {
   } catch (err) {
     console.error("⚠️ Index creation warning:", err.message);
   }
+}
+
+// ===== HELPER: Invalidate All Sensor History Cache Keys =====
+function invalidateSensorHistoryCache() {
+  cache
+    .keys()
+    .filter((k) => k.startsWith("sensor_history"))
+    .forEach((k) => cache.del(k));
 }
 
 // ===== HELPER: Get or Create Control State (write version) =====
@@ -229,7 +242,57 @@ async function getControlStateForRead() {
   return control;
 }
 
-// ===== ANOMALY RULES (rule-based, from offline ML thresholds) =====
+// ===== ML PREDICTION HELPER =====
+// Requires predict.py and poultry_rf_model.pkl in same directory
+function runMLPrediction(features) {
+  return new Promise((resolve) => {
+    const {
+      temperature,
+      humidity,
+      ammonia,
+      methane,
+      fanIntakeRpm,
+      fanExhaustRpm,
+      fanIntakeDuty,
+      fanExhaustDuty,
+    } = features;
+
+    const featureArray = [
+      temperature,
+      humidity,
+      ammonia,
+      methane,
+      fanIntakeRpm,
+      fanExhaustRpm,
+      fanIntakeDuty,
+      fanExhaustDuty,
+    ];
+
+    const inputJson = JSON.stringify(featureArray);
+    const scriptPath = path.join(__dirname, "predict.py");
+
+    exec(
+      `python3 "${scriptPath}" '${inputJson}'`,
+      { timeout: 5000 },
+      (err, stdout) => {
+        if (err) {
+          console.error("⚠️ ML prediction error:", err.message);
+          resolve(null);
+          return;
+        }
+        try {
+          resolve(JSON.parse(stdout.trim()));
+        } catch (parseErr) {
+          console.error("⚠️ ML prediction parse error:", parseErr.message);
+          resolve(null);
+        }
+      }
+    );
+  });
+}
+
+// ===== ANOMALY ALERT GENERATION =====
+// Thresholds aligned with ML model labels
 function generateAlertsFromReading(reading) {
   const alerts = [];
 
@@ -243,26 +306,134 @@ function generateAlertsFromReading(reading) {
     fanExhaustRpm,
     fanIntakeDuty,
     fanExhaustDuty,
+    mode,
     createdAt,
   } = reading;
 
   const readingTime = createdAt || new Date();
   const hid = houseId || "house-1";
+  const isFORCE_OFF =
+    (mode || "AUTO").toString().trim().toUpperCase() === "FORCE_OFF";
 
-  // Temperature (you can tweak these using your offline ML results)
-  if (temperature < 27 || temperature > 36) {
+  // ----- PRIORITY 1: Fan Fault Detection (MODE-AWARE) -----
+  if (!isFORCE_OFF) {
+    if (fanIntakeDuty > 0 && fanIntakeRpm <= 0) {
+      alerts.push({
+        houseId: hid,
+        type: "fault",
+        category: "mechanical",
+        severity: "high",
+        message: `Fan fault detected — Intake fan stall: duty ${fanIntakeDuty}% but RPM is ${fanIntakeRpm}.`,
+        source: "ml-derived-rules",
+        createdAt: readingTime,
+      });
+    }
+
+    if (fanExhaustDuty > 0 && fanExhaustRpm <= 0) {
+      alerts.push({
+        houseId: hid,
+        type: "fault",
+        category: "mechanical",
+        severity: "high",
+        message: `Fan fault detected — Exhaust fan stall: duty ${fanExhaustDuty}% but RPM is ${fanExhaustRpm}.`,
+        source: "ml-derived-rules",
+        createdAt: readingTime,
+      });
+    }
+
+    if (fanIntakeDuty >= 30 && fanIntakeRpm > 0 && fanIntakeRpm < 1500) {
+      alerts.push({
+        houseId: hid,
+        type: "warning",
+        category: "mechanical",
+        severity: "medium",
+        message: `Intake fan running slower than expected: duty ${fanIntakeDuty}%, RPM ${fanIntakeRpm} (< 1500). Possible obstruction or wear.`,
+        source: "ml-derived-rules",
+        createdAt: readingTime,
+      });
+    }
+
+    if (fanExhaustDuty >= 30 && fanExhaustRpm > 0 && fanExhaustRpm < 1500) {
+      alerts.push({
+        houseId: hid,
+        type: "warning",
+        category: "mechanical",
+        severity: "medium",
+        message: `Exhaust fan running slower than expected: duty ${fanExhaustDuty}%, RPM ${fanExhaustRpm} (< 1500). Possible obstruction or wear.`,
+        source: "ml-derived-rules",
+        createdAt: readingTime,
+      });
+    }
+  }
+
+  // ----- PRIORITY 2: Critical Environmental Conditions -----
+  if (temperature < 30 || temperature > 37) {
     alerts.push({
       houseId: hid,
       type: "critical",
       category: "environment",
       severity: "high",
-      message: `Critical temperature condition detected (${temperature.toFixed(
+      message: `Critical temperature detected (${temperature.toFixed(
         1
-      )} °C).`,
+      )} °C). Safe range: 30–37°C.`,
       source: "ml-derived-rules",
       createdAt: readingTime,
     });
-  } else if (temperature < 29 || temperature > 34) {
+  }
+
+  if (humidity < 55 || humidity > 80) {
+    alerts.push({
+      houseId: hid,
+      type: "critical",
+      category: "environment",
+      severity: "high",
+      message: `Critical humidity detected (${humidity.toFixed(
+        1
+      )} %). Safe range: 55–80%.`,
+      source: "ml-derived-rules",
+      createdAt: readingTime,
+    });
+  }
+
+  if (ammonia > 20) {
+    alerts.push({
+      houseId: hid,
+      type: "critical",
+      category: "environment",
+      severity: "high",
+      message: `Critical ammonia level detected (${ammonia.toFixed(
+        1
+      )} ppm). Threshold: > 20 ppm.`,
+      source: "ml-derived-rules",
+      createdAt: readingTime,
+    });
+  }
+
+  if (methane > 8) {
+    alerts.push({
+      houseId: hid,
+      type: "critical",
+      category: "environment",
+      severity: "high",
+      message: `Critical methane level detected (${methane.toFixed(
+        1
+      )} ppm). Threshold: > 8 ppm.`,
+      source: "ml-derived-rules",
+      createdAt: readingTime,
+    });
+  }
+
+  // ----- PRIORITY 3: Warning Environmental Conditions -----
+  const hasTempCritical = temperature < 30 || temperature > 37;
+  const hasHumCritical = humidity < 55 || humidity > 80;
+  const hasNH3Critical = ammonia > 20;
+  const hasCH4Critical = methane > 8;
+
+  if (
+    !hasTempCritical &&
+    ((temperature >= 30 && temperature < 32) ||
+      (temperature > 35 && temperature <= 37))
+  ) {
     alerts.push({
       houseId: hid,
       type: "warning",
@@ -270,26 +441,17 @@ function generateAlertsFromReading(reading) {
       severity: "medium",
       message: `Temperature approaching unsafe range (${temperature.toFixed(
         1
-      )} °C).`,
+      )} °C). Optimal: 32–35°C.`,
       source: "ml-derived-rules",
       createdAt: readingTime,
     });
   }
 
-  // Humidity
-  if (humidity < 40 || humidity > 80) {
-    alerts.push({
-      houseId: hid,
-      type: "critical",
-      category: "environment",
-      severity: "high",
-      message: `Critical humidity condition detected (${humidity.toFixed(
-        1
-      )} %).`,
-      source: "ml-derived-rules",
-      createdAt: readingTime,
-    });
-  } else if (humidity < 45 || humidity > 75) {
+  if (
+    !hasHumCritical &&
+    ((humidity >= 55 && humidity < 60) ||
+      (humidity > 70 && humidity <= 80))
+  ) {
     alerts.push({
       houseId: hid,
       type: "warning",
@@ -297,89 +459,35 @@ function generateAlertsFromReading(reading) {
       severity: "medium",
       message: `Humidity approaching unsafe range (${humidity.toFixed(
         1
-      )} %).`,
+      )} %). Optimal: 60–70%.`,
       source: "ml-derived-rules",
       createdAt: readingTime,
     });
   }
 
-  // Ammonia
-  if (ammonia >= 25) {
-    alerts.push({
-      houseId: hid,
-      type: "critical",
-      category: "environment",
-      severity: "high",
-      message: `Ammonia levels in dangerous range (${ammonia.toFixed(
-        1
-      )} ppm).`,
-      source: "ml-derived-rules",
-      createdAt: readingTime,
-    });
-  } else if (ammonia >= 15) {
+  if (!hasNH3Critical && ammonia > 10 && ammonia <= 20) {
     alerts.push({
       houseId: hid,
       type: "warning",
       category: "environment",
       severity: "medium",
-      message: `Ammonia levels approaching unsafe range (${ammonia.toFixed(
+      message: `Ammonia levels rising (${ammonia.toFixed(
         1
-      )} ppm).`,
+      )} ppm). Warning range: 10–20 ppm.`,
       source: "ml-derived-rules",
       createdAt: readingTime,
     });
   }
 
-  // Methane
-  if (methane > 10) {
-    alerts.push({
-      houseId: hid,
-      type: "critical",
-      category: "environment",
-      severity: "high",
-      message: `Methane levels detected above safe range (${methane.toFixed(
-        1
-      )} ppm).`,
-      source: "ml-derived-rules",
-      createdAt: readingTime,
-    });
-  } else if (methane > 5) {
+  if (!hasCH4Critical && methane > 4 && methane <= 8) {
     alerts.push({
       houseId: hid,
       type: "warning",
       category: "environment",
       severity: "medium",
-      message: `Methane levels rising above normal (${methane.toFixed(
+      message: `Methane levels rising (${methane.toFixed(
         1
-      )} ppm).`,
-      source: "ml-derived-rules",
-      createdAt: readingTime,
-    });
-  }
-
-  // Fan mechanical faults (ONLY if duty > 0)
-  const fanIntakeDutyOn = fanIntakeDuty && fanIntakeDuty > 0;
-  const fanExhaustDutyOn = fanExhaustDuty && fanExhaustDuty > 0;
-
-  if (fanIntakeDutyOn && (!fanIntakeRpm || fanIntakeRpm < 100)) {
-    alerts.push({
-      houseId: hid,
-      type: "critical",
-      category: "mechanical",
-      severity: "high",
-      message: `Possible intake fan fault: duty ${fanIntakeDuty}% but RPM ${fanIntakeRpm}.`,
-      source: "ml-derived-rules",
-      createdAt: readingTime,
-    });
-  }
-
-  if (fanExhaustDutyOn && (!fanExhaustRpm || fanExhaustRpm < 100)) {
-    alerts.push({
-      houseId: hid,
-      type: "critical",
-      category: "mechanical",
-      severity: "high",
-      message: `Possible exhaust fan fault: duty ${fanExhaustDuty}% but RPM ${fanExhaustRpm}.`,
+      )} ppm). Warning range: 4–8 ppm.`,
       source: "ml-derived-rules",
       createdAt: readingTime,
     });
@@ -395,7 +503,7 @@ app.get("/health", (req, res) => {
   res.json({
     status: "Backend is running",
     timestamp: new Date().toISOString(),
-    version: "2.6.0-concurrency-safe",
+    version: "3.0.0-ml-aligned",
     cache: {
       keys: cache.keys().length,
       stats: cache.getStats(),
@@ -403,7 +511,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// 1️⃣ POST /api/sensors - ESP32 Fan MCU sends full sensor data
+// 1️⃣ POST /api/sensors
 app.post("/api/sensors", async (req, res) => {
   try {
     const {
@@ -455,8 +563,26 @@ app.post("/api/sensors", async (req, res) => {
       await Alert.insertMany(alertsToCreate);
     }
 
+    runMLPrediction({
+      temperature,
+      humidity,
+      ammonia,
+      methane,
+      fanIntakeRpm: fanIntakeRpm || 0,
+      fanExhaustRpm: fanExhaustRpm || 0,
+      fanIntakeDuty: fanIntakeDuty || 0,
+      fanExhaustDuty: fanExhaustDuty || 0,
+    }).then((prediction) => {
+      if (prediction) {
+        console.log(
+          `🤖 ML Prediction → ${prediction.statusLabel} (Class ${prediction.statusCode})`
+        );
+        cache.set("latest_ml_prediction", prediction, 30);
+      }
+    });
+
     cache.del("latest_sensor");
-    cache.del("sensor_history");
+    invalidateSensorHistoryCache();
 
     return res.status(201).json({
       success: true,
@@ -520,7 +646,7 @@ app.get("/api/sensors/history", async (req, res) => {
   }
 });
 
-// 4️⃣ GET /api/control/state - ESP32 & Frontend get current control state
+// 4️⃣ GET /api/control/state
 app.get("/api/control/state", async (req, res) => {
   try {
     const control = await getControlStateForRead();
@@ -531,7 +657,7 @@ app.get("/api/control/state", async (req, res) => {
   }
 });
 
-// 5️⃣ POST /api/control - Dashboard sends TWO-WAY control commands (atomic)
+// 5️⃣ POST /api/control
 app.post("/api/control", async (req, res) => {
   try {
     const { device, mode, timerDuration } = req.body;
@@ -568,48 +694,41 @@ app.post("/api/control", async (req, res) => {
       });
     }
 
-    const updateObj = {};
+    const control = await getControlState();
 
-    // Per-device fields to update
     for (const dev of targetDevices) {
-      updateObj[`${dev}.mode`] = mode;
+      control[dev].mode = mode;
 
       if (mode === "FORCE_ON") {
-        updateObj[`${dev}.state`] = "ON";
+        control[dev].state = "ON";
       } else if (mode === "FORCE_OFF") {
-        updateObj[`${dev}.state`] = "OFF";
+        control[dev].state = "OFF";
       }
     }
 
-    // Pressure washer timer handling
     if (targetDevices.includes("pressure_washer")) {
       if (mode === "FORCE_ON") {
         const duration = parseInt(timerDuration, 10) || 300;
         const now = new Date();
         const expires = new Date(now.getTime() + duration * 1000);
 
-        updateObj["pressure_washer.timerDuration"] = duration;
-        updateObj["pressure_washer.timerStartedAt"] = now;
-        updateObj["pressure_washer.timerExpiresAt"] = expires;
+        control.pressure_washer.timerDuration = duration;
+        control.pressure_washer.timerStartedAt = now;
+        control.pressure_washer.timerExpiresAt = expires;
 
         console.log(
           `🚿 Pressure washer ON — auto-OFF in ${duration}s at ${expires.toISOString()}`
         );
       } else if (mode === "FORCE_OFF") {
-        updateObj["pressure_washer.timerDuration"] = 0;
-        updateObj["pressure_washer.timerStartedAt"] = null;
-        updateObj["pressure_washer.timerExpiresAt"] = null;
+        control.pressure_washer.timerDuration = 0;
+        control.pressure_washer.timerStartedAt = null;
+        control.pressure_washer.timerExpiresAt = null;
         console.log("🚿 Pressure washer manually turned OFF");
       }
     }
 
-    updateObj.updatedAt = new Date();
-
-    const control = await ControlState.findOneAndUpdate(
-      {},
-      { $set: updateObj },
-      { new: true, upsert: true }
-    );
+    control.updatedAt = new Date();
+    await control.save();
 
     cache.del("control_state");
     cache.del("control_state_read");
@@ -625,7 +744,7 @@ app.post("/api/control", async (req, res) => {
   }
 });
 
-// 6️⃣ GET /api/alerts - Dashboard early warning alerts
+// 6️⃣ GET /api/alerts
 app.get("/api/alerts", async (req, res) => {
   try {
     const { limit = 20 } = req.query;
@@ -642,27 +761,20 @@ app.get("/api/alerts", async (req, res) => {
   }
 });
 
-// 7️⃣ POST /api/light-status — Light MCU sends ONLY light/washer status (atomic)
+// 7️⃣ POST /api/light-status
 app.post("/api/light-status", async (req, res) => {
   try {
     const { light, lightStatus, pressureWasherStatus } = req.body;
 
-    const updateFields = {};
-    if (light != null && light >= 0) updateFields.light = light;
-    if (lightStatus) updateFields.lightStatus = lightStatus;
-    if (pressureWasherStatus) updateFields.pressureWasherStatus =
-      pressureWasherStatus;
+    const latestSensor = await SensorData.findOne().sort({ createdAt: -1 });
 
-    const latestUpdated = await SensorData.findOneAndUpdate(
-      {},
-      { $set: updateFields },
-      {
-        sort: { createdAt: -1 },
-        new: true,
-      }
-    );
-
-    if (!latestUpdated) {
+    if (latestSensor) {
+      if (light != null && light >= 0) latestSensor.light = light;
+      if (lightStatus) latestSensor.lightStatus = lightStatus;
+      if (pressureWasherStatus)
+        latestSensor.pressureWasherStatus = pressureWasherStatus;
+      await latestSensor.save();
+    } else {
       await SensorData.create({
         houseId: "house-1",
         temperature: 0,
@@ -681,7 +793,7 @@ app.post("/api/light-status", async (req, res) => {
     }
 
     cache.del("latest_sensor");
-    cache.del("sensor_history");
+    invalidateSensorHistoryCache();
 
     return res.json({
       success: true,
@@ -693,7 +805,67 @@ app.post("/api/light-status", async (req, res) => {
   }
 });
 
-// ===== PRESSURE WASHER SAFETY TIMER (background) =====
+// 8️⃣ POST /api/predict
+app.post("/api/predict", async (req, res) => {
+  try {
+    const {
+      temperature,
+      humidity,
+      ammonia,
+      methane,
+      fanIntakeRpm,
+      fanExhaustRpm,
+      fanIntakeDuty,
+      fanExhaustDuty,
+    } = req.body;
+
+    if (
+      temperature === undefined ||
+      humidity === undefined ||
+      ammonia === undefined ||
+      methane === undefined
+    ) {
+      return res.status(400).json({
+        error:
+          "Missing required fields: temperature, humidity, ammonia, methane",
+      });
+    }
+
+    const prediction = await runMLPrediction({
+      temperature,
+      humidity,
+      ammonia,
+      methane,
+      fanIntakeRpm: fanIntakeRpm || 0,
+      fanExhaustRpm: fanExhaustRpm || 0,
+      fanIntakeDuty: fanIntakeDuty || 0,
+      fanExhaustDuty: fanExhaustDuty || 0,
+    });
+
+    if (!prediction) {
+      return res.status(503).json({
+        error:
+          "ML prediction unavailable. Ensure predict.py and poultry_rf_model.pkl are deployed.",
+      });
+    }
+
+    return res.json({ success: true, prediction });
+  } catch (err) {
+    console.error("Error in /api/predict:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+// 9️⃣ GET /api/predict/latest
+app.get("/api/predict/latest", (req, res) => {
+  const prediction = cache.get("latest_ml_prediction");
+  if (!prediction) {
+    return res.status(404).json({ message: "No ML prediction available yet" });
+  }
+  return res.json({ success: true, prediction });
+});
+
+// ===== PRESSURE WASHER SAFETY TIMER =====
 setInterval(async () => {
   try {
     const control = await ControlState.findOne();
@@ -722,7 +894,7 @@ setInterval(async () => {
   }
 }, 10000);
 
-// ===== TEMP: RESET CONTROL STATE (MIGRATION) =====
+// ===== ADMIN: RESET CONTROL STATE =====
 app.post("/admin/reset-control", async (req, res) => {
   try {
     await ControlState.deleteMany({});
@@ -771,5 +943,6 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
   console.log(`📊 Caching enabled with 5-second TTL`);
-  console.log(`🔒 Rate limiting: 300 requests/minute`);
+  console.log(`🔒 Rate limiting: 100 requests/minute`);
+  console.log(`🤖 ML prediction endpoint: POST /api/predict`);
 });
