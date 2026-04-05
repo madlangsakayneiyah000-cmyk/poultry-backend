@@ -256,185 +256,117 @@ function generateAlertsFromReading(reading) {
 
   // ----------------- ENVIRONMENTAL RULES -----------------
 
-  // Temperature (°C)
+
+function generateAlertsFromReading(reading) {
+  const alerts = [];
+  const {
+    temperature,
+    humidity,
+    ammonia,
+    methane,
+    fanIntakeRpm,
+    fanExhaustRpm,
+    fanIntakeDuty,
+    fanExhaustDuty,
+    mode,
+    houseId,
+    createdAt,
+  } = reading;
+
+  const readingTime = createdAt || new Date();
+  const hid = houseId || "house-1";
+  const modeStr = (mode || "AUTO").toString().trim().toUpperCase();
+  const isForceOff = modeStr === "FORCE_OFF";
+
+  // Data Normalization (Numbers)
   const t = Number(temperature);
-  const tempCritical = t < 30 || t > 37;
-  const tempWarning =
-    !tempCritical && ((t >= 30 && t < 32) || (t > 35 && t <= 37));
-
-  if (tempCritical) {
-    alerts.push({
-      houseId: hid,
-      type: "critical",
-      category: "environment",
-      severity: "high",
-      message: `Critical temperature condition detected (${t.toFixed(1)} °C).`,
-      source: "ml-derived-rules",
-      createdAt: readingTime,
-    });
-  } else if (tempWarning) {
-    alerts.push({
-      houseId: hid,
-      type: "warning",
-      category: "environment",
-      severity: "medium",
-      message: `Temperature approaching unsafe range (${t.toFixed(1)} °C).`,
-      source: "ml-derived-rules",
-      createdAt: readingTime,
-    });
-  }
-
-  // Humidity (%)
   const h = Number(humidity);
-  const humCritical = h < 55 || h > 80;
-  const humWarning =
-    !humCritical && ((h >= 55 && h < 60) || (h > 70 && h <= 80));
-
-  if (humCritical) {
-    alerts.push({
-      houseId: hid,
-      type: "critical",
-      category: "environment",
-      severity: "high",
-      message: `Critical humidity condition detected (${h.toFixed(1)} %).`,
-      source: "ml-derived-rules",
-      createdAt: readingTime,
-    });
-  } else if (humWarning) {
-    alerts.push({
-      houseId: hid,
-      type: "warning",
-      category: "environment",
-      severity: "medium",
-      message: `Humidity approaching unsafe range (${h.toFixed(1)} %).`,
-      source: "ml-derived-rules",
-      createdAt: readingTime,
-    });
-  }
-
-  // Ammonia (ppm)
   const a = Number(ammonia);
-  const nh3Critical = a > 20;
-  const nh3Warning = !nh3Critical && a > 10 && a <= 20;
-
-  if (nh3Critical) {
-    alerts.push({
-      houseId: hid,
-      type: "critical",
-      category: "environment",
-      severity: "high",
-      message: `Ammonia levels in dangerous range (${a.toFixed(1)} ppm).`,
-      source: "ml-derived-rules",
-      createdAt: readingTime,
-    });
-  } else if (nh3Warning) {
-    alerts.push({
-      houseId: hid,
-      type: "warning",
-      category: "environment",
-      severity: "medium",
-      message: `Ammonia levels approaching unsafe range (${a.toFixed(
-        1
-      )} ppm).`,
-      source: "ml-derived-rules",
-      createdAt: readingTime,
-    });
-  }
-
-  // Methane (ppm)
   const m = Number(methane);
-  const ch4Critical = m > 8;
-  const ch4Warning = !ch4Critical && m > 4 && m <= 8;
-
-  if (ch4Critical) {
-    alerts.push({
-      houseId: hid,
-      type: "critical",
-      category: "environment",
-      severity: "high",
-      message: `Methane levels detected above safe range (${m.toFixed(
-        1
-      )} ppm).`,
-      source: "ml-derived-rules",
-      createdAt: readingTime,
-    });
-  } else if (ch4Warning) {
-    alerts.push({
-      houseId: hid,
-      type: "warning",
-      category: "environment",
-      severity: "medium",
-      message: `Methane levels rising above normal (${m.toFixed(
-        1
-      )} ppm).`,
-      source: "ml-derived-rules",
-      createdAt: readingTime,
-    });
-  }
-
-  // ----------------- FAN FAULT RULES (MODE-AWARE) -----------------
-
   const fiDuty = Number(fanIntakeDuty) || 0;
   const fiRpm = Number(fanIntakeRpm) || 0;
   const feDuty = Number(fanExhaustDuty) || 0;
   const feRpm = Number(fanExhaustRpm) || 0;
 
-  const isForceOff = modeStr === "FORCE_OFF";
-
-  const intakeWarning =
-    !isForceOff && fiDuty >= 30 && fiRpm > 0 && fiRpm < 1500;
-  const exhaustWarning =
-    !isForceOff && feDuty >= 30 && feRpm > 0 && feRpm < 1500;
-
+  // ============================================================
+  // 1. FAULT DETECTION (Priority 1 - Class 3)
+  // ============================================================
   const intakeStall = !isForceOff && fiDuty > 0 && fiRpm <= 0;
   const exhaustStall = !isForceOff && feDuty > 0 && feRpm <= 0;
+  const tempSensorFault = (t === 0); // Imposibleng 0°C sa PH farm, likely sira ang DHT22
 
-  if (intakeStall) {
+  if (intakeStall || exhaustStall || tempSensorFault) {
+    let faultMsg = "Hardware Fault: ";
+    if (intakeStall) faultMsg += "Intake Fan Stall. ";
+    if (exhaustStall) faultMsg += "Exhaust Fan Stall. ";
+    if (tempSensorFault) faultMsg += "Temp Sensor Error (0°C). ";
+
     alerts.push({
       houseId: hid,
-      type: "critical",
+      type: "fault", // Class 3
       category: "mechanical",
       severity: "high",
-      message: `Possible intake fan stall: duty ${fiDuty}% but RPM ${fiRpm}.`,
+      message: faultMsg.trim(),
       source: "ml-derived-rules",
       createdAt: readingTime,
     });
   }
-  if (exhaustStall) {
+
+  // ============================================================
+  // 2. CRITICAL CONDITIONS (Priority 2 - Class 2)
+  // ============================================================
+  // Note: t > 0 para hindi mag-overlap sa Fault logic
+  const tempCritical = (t > 0 && t < 30) || t > 37;
+  const humCritical = h < 55 || h > 80;
+  const nh3Critical = a > 20;
+  const ch4Critical = m > 8;
+
+  if (tempCritical || humCritical || nh3Critical || ch4Critical) {
+    let critMsg = "Critical Condition: ";
+    if (tempCritical) critMsg += `Extreme Temp (${t.toFixed(1)}°C). `;
+    if (humCritical) critMsg += `Extreme Hum (${h.toFixed(1)}%). `;
+    if (nh3Critical) critMsg += `High Ammonia (${a.toFixed(1)}ppm). `;
+    if (ch4Critical) critMsg += `High Methane (${m.toFixed(1)}ppm). `;
+
     alerts.push({
       houseId: hid,
-      type: "critical",
-      category: "mechanical",
+      type: "critical", // Class 2
+      category: "environment",
       severity: "high",
-      message: `Possible exhaust fan stall: duty ${feDuty}% but RPM ${feRpm}.`,
+      message: critMsg.trim(),
       source: "ml-derived-rules",
       createdAt: readingTime,
     });
   }
 
-  if (intakeWarning) {
+  // ============================================================
+  // 3. WARNING CONDITIONS (Priority 3 - Class 1)
+  // ============================================================
+  const tempWarning = !tempCritical && t !== 0 && ((t >= 30 && t < 32) || (t > 35 && t <= 37));
+  const humWarning = !humCritical && ((h >= 55 && h < 60) || (h > 70 && h <= 80));
+  const nh3Warning = !nh3Critical && (a > 10 && a <= 20);
+  const ch4Warning = !ch4Critical && (m > 4 && m <= 8);
+  const fanDegraded = !isForceOff && ((fiDuty >= 30 && fiRpm > 0 && fiRpm < 1500) || (feDuty >= 30 && feRpm > 0 && feRpm < 1500));
+
+  if (tempWarning || humWarning || nh3Warning || ch4Warning || fanDegraded) {
+    let warnMsg = "Warning: ";
+    if (tempWarning) warnMsg += "Temp unstable. ";
+    if (humWarning) warnMsg += "Hum unstable. ";
+    if (nh3Warning || ch4Warning) warnMsg += "Gas levels rising. ";
+    if (fanDegraded) warnMsg += "Low fan RPM. ";
+
     alerts.push({
       houseId: hid,
-      type: "warning",
-      category: "mechanical",
+      type: "warning", // Class 1
+      category: fanDegraded ? "mechanical" : "environment",
       severity: "medium",
-      message: `Intake fan running slower than expected: duty ${fiDuty}% but RPM ${fiRpm}.`,
-      source: "ml-derived-rules",
-      createdAt: readingTime,
-    });
-  }
-  if (exhaustWarning) {
-    alerts.push({
-      houseId: hid,
-      type: "warning",
-      category: "mechanical",
-      severity: "medium",
-      message: `Exhaust fan running slower than expected: duty ${feDuty}% but RPM ${feRpm}.`,
+      message: warnMsg.trim(),
       source: "ml-derived-rules",
       createdAt: readingTime,
     });
   }
 
+  // NOTE: Walang alert record para sa Normal (Class 0) para tipid sa database.
   return alerts;
 }
 
